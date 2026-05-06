@@ -118,7 +118,7 @@ class RegisterService:
         items = account_service.list_accounts()
         normal = [item for item in items if item.get("status") == "正常"]
         return {
-            "current_quota": sum(int(item.get("quota") or 0) for item in normal if not item.get("imageQuotaUnknown")),
+            "current_quota": sum(int(item.get("quota") or 0) for item in normal if not item.get("image_quota_unknown")),
             "current_available": len(normal),
         }
 
@@ -156,12 +156,12 @@ class RegisterService:
             self._save()
 
     def _run(self) -> None:
-        cfg = self.get()
-        threads = int(cfg["threads"])
+        threads = int(self.get()["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
+                cfg = self.get()
                 while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted))

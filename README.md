@@ -24,11 +24,37 @@
 
 已发布镜像支持 `linux/amd64` 与 `linux/arm64`，在 x86 服务器和 Apple Silicon / ARM Linux 设备上都会自动拉取匹配架构的版本。
 
+### Docker 运行
+
 ```bash
 git clone git@github.com:basketikun/chatgpt2api.git
-# 按需编辑 config.json 的密钥和 `refresh_account_interval_minute`
-# 也可以直接通过环境变量 CHATGPT2API_AUTH_KEY 覆盖 auth-key
+cd chatgpt2api
 docker compose up -d
+```
+
+启动前请先在 `config.json` 中设置 `auth-key`，也可以在 `docker-compose.yml` 中通过 `CHATGPT2API_AUTH_KEY` 覆盖。
+
+- Web 面板：`http://localhost:3000`
+- API 地址：`http://localhost:3000/v1`
+- 数据目录：`./data`
+
+### 本地开发
+
+启动后端：
+
+```bash
+git clone git@github.com:basketikun/chatgpt2api.git
+cd chatgpt2api
+uv sync
+uv run main.py
+```
+
+启动前端：
+
+```bash
+cd chatgpt2api/web
+bun install
+bun run dev
 ```
 
 ### 存储后端配置
@@ -41,6 +67,7 @@ docker compose up -d
 - `git` - Git 私有仓库（需配置 `GIT_REPO_URL` 和 `GIT_TOKEN`）
 
 示例：使用 PostgreSQL
+
 ```yaml
 environment:
   - STORAGE_BACKEND=postgres
@@ -58,7 +85,8 @@ environment:
 - `GET /v1/models` 返回 `gpt-image-2`、`codex-gpt-image-2`、`auto`、`gpt-5`、`gpt-5-1`、`gpt-5-2`、`gpt-5-3`、`gpt-5-3-mini`、
   `gpt-5-mini`
 - 支持通过 `n` 返回多张生成结果
-- 支持 Codex 中的画图接口逆向，仅 `Plus` / `Team` / `Pro` 订阅可用，模型别名为 `codex-gpt-image-2`，如有需要可自行在其他场景映射回 `gpt-image-2`，用于和官网画图区分；也就意味着同一账号会同时有官网和 Codex 两份生图额度
+- 支持 Codex 中的画图接口逆向，仅 `Plus` / `Team` / `Pro` 订阅可用，模型别名为 `codex-gpt-image-2`，如有需要可自行在其他场景映射回
+  `gpt-image-2`，用于和官网画图区分；也就意味着同一账号会同时有官网和 Codex 两份生图额度
 
 ### 在线画图功能
 

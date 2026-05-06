@@ -5,18 +5,25 @@ import { toast } from "sonner";
 
 import {
   createCPAPool,
+  deleteBackup,
   deleteCPAPool,
   fetchCPAPoolFiles,
   fetchCPAPools,
+  fetchBackups,
   fetchRegisterConfig,
   resetRegister as resetRegisterApi,
   fetchSettingsConfig,
+  runBackupNow,
   startRegister,
   startCPAImport,
   stopRegister,
+  testBackupConnection,
   updateCPAPool,
   updateRegisterConfig,
   updateSettingsConfig,
+  type BackupItem,
+  type BackupSettings,
+  type BackupState,
   type CPAPool,
   type CPARemoteFile,
   type RegisterConfig,
@@ -28,15 +35,76 @@ export const PAGE_SIZE_OPTIONS = ["50", "100", "200"] as const;
 export type PageSizeOption = (typeof PAGE_SIZE_OPTIONS)[number];
 
 function normalizeConfig(config: SettingsConfig): SettingsConfig {
+  const backup = typeof config.backup === "object" && config.backup
+    ? config.backup as BackupSettings
+    : {
+      enabled: false,
+      provider: "cloudflare_r2",
+      account_id: "",
+      access_key_id: "",
+      secret_access_key: "",
+      bucket: "",
+      prefix: "backups",
+      interval_minutes: 360,
+      rotation_keep: 10,
+      encrypt: false,
+      passphrase: "",
+      include: {
+        config: true,
+        register: true,
+        cpa: true,
+        sub2api: true,
+        logs: true,
+        image_tasks: true,
+        accounts_snapshot: true,
+        auth_keys_snapshot: true,
+        images: false,
+      },
+    };
   return {
     ...config,
     refresh_account_interval_minute: Number(config.refresh_account_interval_minute || 5),
     image_retention_days: Number(config.image_retention_days || 30),
+    image_poll_timeout_secs: Number(config.image_poll_timeout_secs || 120),
+    image_account_concurrency: Number(config.image_account_concurrency || 3),
     auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
     auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
     log_levels: Array.isArray(config.log_levels) ? config.log_levels : [],
     proxy: typeof config.proxy === "string" ? config.proxy : "",
     base_url: typeof config.base_url === "string" ? config.base_url : "",
+    global_system_prompt: String(config.global_system_prompt || ""),
+    sensitive_words: Array.isArray(config.sensitive_words) ? config.sensitive_words : [],
+    ai_review: {
+      enabled: Boolean(config.ai_review?.enabled),
+      base_url: String(config.ai_review?.base_url || ""),
+      api_key: String(config.ai_review?.api_key || ""),
+      model: String(config.ai_review?.model || ""),
+      prompt: String(config.ai_review?.prompt || ""),
+    },
+    backup: {
+      ...backup,
+      enabled: Boolean(backup.enabled),
+      account_id: String(backup.account_id || ""),
+      access_key_id: String(backup.access_key_id || ""),
+      secret_access_key: String(backup.secret_access_key || ""),
+      bucket: String(backup.bucket || ""),
+      prefix: String(backup.prefix || "backups"),
+      interval_minutes: Number(backup.interval_minutes || 360),
+      rotation_keep: Number(backup.rotation_keep ?? 10),
+      encrypt: Boolean(backup.encrypt),
+      passphrase: String(backup.passphrase || ""),
+      include: {
+        config: Boolean(backup.include?.config ?? true),
+        register: Boolean(backup.include?.register ?? true),
+        cpa: Boolean(backup.include?.cpa ?? true),
+        sub2api: Boolean(backup.include?.sub2api ?? true),
+        logs: Boolean(backup.include?.logs ?? true),
+        image_tasks: Boolean(backup.include?.image_tasks ?? true),
+        accounts_snapshot: Boolean(backup.include?.accounts_snapshot ?? true),
+        auth_keys_snapshot: Boolean(backup.include?.auth_keys_snapshot ?? true),
+        images: Boolean(backup.include?.images ?? false),
+      },
+    },
   };
 }
 
@@ -61,6 +129,12 @@ type SettingsStore = {
   config: SettingsConfig | null;
   isLoadingConfig: boolean;
   isSavingConfig: boolean;
+  backups: BackupItem[];
+  backupState: BackupState | null;
+  isLoadingBackups: boolean;
+  isRunningBackup: boolean;
+  deletingBackupKey: string | null;
+  isTestingBackup: boolean;
 
   registerConfig: RegisterConfig | null;
   isLoadingRegister: boolean;
@@ -90,14 +164,25 @@ type SettingsStore = {
 
   initialize: () => Promise<void>;
   loadConfig: () => Promise<void>;
-  saveConfig: () => Promise<void>;
+  saveConfig: () => Promise<boolean>;
+  loadBackups: (silent?: boolean) => Promise<void>;
+  runBackup: () => Promise<void>;
+  removeBackup: (key: string) => Promise<void>;
+  testBackup: () => Promise<void>;
   setRefreshAccountIntervalMinute: (value: string) => void;
   setImageRetentionDays: (value: string) => void;
+  setImagePollTimeoutSecs: (value: string) => void;
+  setImageAccountConcurrency: (value: string) => void;
   setAutoRemoveInvalidAccounts: (value: boolean) => void;
   setAutoRemoveRateLimitedAccounts: (value: boolean) => void;
   setLogLevel: (level: string, enabled: boolean) => void;
   setProxy: (value: string) => void;
   setBaseUrl: (value: string) => void;
+  setGlobalSystemPrompt: (value: string) => void;
+  setSensitiveWordsText: (value: string) => void;
+  setAIReviewField: (key: "enabled" | "base_url" | "api_key" | "model" | "prompt", value: string | boolean) => void;
+  setBackupField: (key: keyof BackupSettings, value: string | boolean) => void;
+  setBackupInclude: (key: keyof BackupSettings["include"], value: boolean) => void;
 
   loadRegister: (silent?: boolean) => Promise<void>;
   setRegisterConfig: (config: RegisterConfig) => void;
@@ -141,6 +226,12 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   config: null,
   isLoadingConfig: true,
   isSavingConfig: false,
+  backups: [],
+  backupState: null,
+  isLoadingBackups: true,
+  isRunningBackup: false,
+  deletingBackupKey: null,
+  isTestingBackup: false,
 
   registerConfig: null,
   isLoadingRegister: true,
@@ -170,14 +261,27 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   initialize: async () => {
     await Promise.allSettled([get().loadConfig(), get().loadPools()]);
+    const backup = get().config?.backup;
+    const isConfigured = Boolean(
+      String(backup?.account_id || "").trim()
+      && String(backup?.access_key_id || "").trim()
+      && String(backup?.secret_access_key || "").trim()
+      && String(backup?.bucket || "").trim(),
+    );
+    if (isConfigured) {
+      await get().loadBackups();
+    } else {
+      set({ backups: [], isLoadingBackups: false });
+    }
   },
 
   loadConfig: async () => {
     set({ isLoadingConfig: true });
     try {
       const data = await fetchSettingsConfig();
+      const normalized = normalizeConfig(data.config);
       set({
-        config: normalizeConfig(data.config),
+        config: normalized,
       });
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "加载系统配置失败");
@@ -189,7 +293,7 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
   saveConfig: async () => {
     const { config } = get();
     if (!config) {
-      return;
+      return false;
     }
 
     set({ isSavingConfig: true });
@@ -198,17 +302,41 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         ...config,
         refresh_account_interval_minute: Math.max(1, Number(config.refresh_account_interval_minute) || 1),
         image_retention_days: Math.max(1, Number(config.image_retention_days) || 30),
+        image_poll_timeout_secs: Math.max(1, Number(config.image_poll_timeout_secs) || 120),
+        image_account_concurrency: Math.max(1, Number(config.image_account_concurrency) || 3),
         auto_remove_invalid_accounts: Boolean(config.auto_remove_invalid_accounts),
         auto_remove_rate_limited_accounts: Boolean(config.auto_remove_rate_limited_accounts),
         proxy: config.proxy.trim(),
         base_url: String(config.base_url || "").trim(),
+        global_system_prompt: String(config.global_system_prompt || "").trim(),
+        sensitive_words: (config.sensitive_words || []).map((item) => String(item).trim()).filter(Boolean),
+        ai_review: {
+          enabled: Boolean(config.ai_review?.enabled),
+          base_url: String(config.ai_review?.base_url || "").trim(),
+          api_key: String(config.ai_review?.api_key || "").trim(),
+          model: String(config.ai_review?.model || "").trim(),
+          prompt: String(config.ai_review?.prompt || "").trim(),
+        },
+        backup: {
+          ...(config.backup as BackupSettings),
+          account_id: String(config.backup?.account_id || "").trim(),
+          access_key_id: String(config.backup?.access_key_id || "").trim(),
+          secret_access_key: String(config.backup?.secret_access_key || "").trim(),
+          bucket: String(config.backup?.bucket || "").trim(),
+          prefix: String(config.backup?.prefix || "backups").trim(),
+          interval_minutes: Math.max(1, Number(config.backup?.interval_minutes) || 360),
+          rotation_keep: Math.max(0, Number(config.backup?.rotation_keep) || 0),
+          passphrase: String(config.backup?.passphrase || "").trim(),
+        },
       });
       set({
         config: normalizeConfig(data.config),
       });
       toast.success("配置已保存");
+      return true;
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "保存系统配置失败");
+      return false;
     } finally {
       set({ isSavingConfig: false });
     }
@@ -230,6 +358,14 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
 
   setImageRetentionDays: (value) => {
     set((state) => state.config ? { config: { ...state.config, image_retention_days: value } } : {});
+  },
+
+  setImagePollTimeoutSecs: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_poll_timeout_secs: value } } : {});
+  },
+
+  setImageAccountConcurrency: (value) => {
+    set((state) => state.config ? { config: { ...state.config, image_account_concurrency: value } } : {});
   },
 
   setAutoRemoveInvalidAccounts: (value) => {
@@ -276,6 +412,122 @@ export const useSettingsStore = create<SettingsStore>((set, get) => ({
         },
       };
     });
+  },
+
+  setGlobalSystemPrompt: (value) => {
+    set((state) => state.config ? { config: { ...state.config, global_system_prompt: value } } : {});
+  },
+
+  setSensitiveWordsText: (value) => {
+    set((state) => state.config ? { config: { ...state.config, sensitive_words: value.split("\n") } } : {});
+  },
+
+  setAIReviewField: (key, value) => {
+    set((state) => state.config ? { config: { ...state.config, ai_review: { ...(state.config.ai_review || {}), [key]: value } } } : {});
+  },
+
+  setBackupField: (key, value) => {
+    set((state) => {
+      if (!state.config?.backup) {
+        return {};
+      }
+      return {
+        config: {
+          ...state.config,
+          backup: {
+            ...state.config.backup,
+            [key]: value,
+          },
+        },
+      };
+    });
+  },
+
+  setBackupInclude: (key, value) => {
+    set((state) => {
+      if (!state.config?.backup) {
+        return {};
+      }
+      return {
+        config: {
+          ...state.config,
+          backup: {
+            ...state.config.backup,
+            include: {
+              ...state.config.backup.include,
+              [key]: value,
+            },
+          },
+        },
+      };
+    });
+  },
+
+  loadBackups: async (silent = false) => {
+    if (!silent) {
+      set({ isLoadingBackups: true });
+    }
+    try {
+      const data = await fetchBackups();
+      set({
+        backups: data.items,
+        backupState: data.state,
+      });
+    } catch (error) {
+      if (!silent) {
+        toast.error(error instanceof Error ? error.message : "加载备份列表失败");
+      }
+    } finally {
+      if (!silent) {
+        set({ isLoadingBackups: false });
+      }
+    }
+  },
+
+  runBackup: async () => {
+    set({ isRunningBackup: true });
+    try {
+      const saved = await get().saveConfig();
+      if (!saved) {
+        return;
+      }
+      const data = await runBackupNow();
+      toast.success(`备份已完成：${data.result.key}`);
+      await get().loadBackups(true);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "执行备份失败");
+    } finally {
+      set({ isRunningBackup: false });
+    }
+  },
+
+  removeBackup: async (key) => {
+    set({ deletingBackupKey: key });
+    try {
+      await deleteBackup(key);
+      toast.success("备份已删除");
+      await get().loadBackups(true);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "删除备份失败");
+    } finally {
+      set({ deletingBackupKey: null });
+    }
+  },
+
+  testBackup: async () => {
+    set({ isTestingBackup: true });
+    try {
+      const saved = await get().saveConfig();
+      if (!saved) {
+        return;
+      }
+      const data = await testBackupConnection();
+      toast.success(`R2 连接正常（HTTP ${data.result.status}）`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "测试备份连接失败");
+    } finally {
+      set({ isTestingBackup: false });
+    }
   },
 
   loadRegister: async (silent = false) => {

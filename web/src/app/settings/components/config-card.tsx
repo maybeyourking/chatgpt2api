@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { testProxy, type ProxyTestResult } from "@/lib/api";
 
 import { useSettingsStore } from "../store";
@@ -21,11 +22,16 @@ export function ConfigCard() {
   const isSavingConfig = useSettingsStore((state) => state.isSavingConfig);
   const setRefreshAccountIntervalMinute = useSettingsStore((state) => state.setRefreshAccountIntervalMinute);
   const setImageRetentionDays = useSettingsStore((state) => state.setImageRetentionDays);
+  const setImagePollTimeoutSecs = useSettingsStore((state) => state.setImagePollTimeoutSecs);
+  const setImageAccountConcurrency = useSettingsStore((state) => state.setImageAccountConcurrency);
   const setAutoRemoveInvalidAccounts = useSettingsStore((state) => state.setAutoRemoveInvalidAccounts);
   const setAutoRemoveRateLimitedAccounts = useSettingsStore((state) => state.setAutoRemoveRateLimitedAccounts);
   const setLogLevel = useSettingsStore((state) => state.setLogLevel);
   const setProxy = useSettingsStore((state) => state.setProxy);
   const setBaseUrl = useSettingsStore((state) => state.setBaseUrl);
+  const setGlobalSystemPrompt = useSettingsStore((state) => state.setGlobalSystemPrompt);
+  const setSensitiveWordsText = useSettingsStore((state) => state.setSensitiveWordsText);
+  const setAIReviewField = useSettingsStore((state) => state.setAIReviewField);
   const saveConfig = useSettingsStore((state) => state.saveConfig);
 
   const handleTestProxy = async () => {
@@ -136,6 +142,26 @@ export function ConfigCard() {
             />
             <p className="text-xs text-stone-500">自动删除多少天前的本地图片。</p>
           </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">图片轮询超时</label>
+            <Input
+              value={String(config?.image_poll_timeout_secs || "")}
+              onChange={(event) => setImagePollTimeoutSecs(event.target.value)}
+              placeholder="120"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">单位秒，等待上游图片结果的最长时间。</p>
+          </div>
+          <div className="space-y-2">
+            <label className="text-sm text-stone-700">单账号图片并发</label>
+            <Input
+              value={String(config?.image_account_concurrency || "")}
+              onChange={(event) => setImageAccountConcurrency(event.target.value)}
+              placeholder="1"
+              className="h-10 rounded-xl border-stone-200 bg-white"
+            />
+            <p className="text-xs text-stone-500">限制每个账号同时处理的图片请求数量，默认 3。</p>
+          </div>
           <label className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-sm text-stone-700">
             <Checkbox
               checked={Boolean(config?.auto_remove_invalid_accounts)}
@@ -165,6 +191,56 @@ export function ConfigCard() {
                   {level}
                 </label>
               ))}
+            </div>
+          </div>
+          <div className="space-y-2 md:col-span-2">
+            <label className="text-sm text-stone-700">全局附加指令</label>
+            <Textarea
+              value={String(config?.global_system_prompt || "")}
+              onChange={(event) => setGlobalSystemPrompt(event.target.value)}
+              placeholder="例如：先判断用户提示词是否合规；遇到违法、色情、暴力、仇恨等请求时拒绝回答。"
+              className="min-h-28 rounded-xl border-stone-200 bg-white font-mono text-xs shadow-none"
+            />
+            <p className="text-xs text-stone-500">每次请求都会作为 system 消息注入，可用于审核用户提示词、避免违规内容、统一约束模型行为或固定角色设定。</p>
+          </div>
+          <div className="space-y-2 md:col-span-2">
+            <label className="text-sm text-stone-700">敏感词</label>
+            <Textarea
+              value={(config?.sensitive_words || []).join("\n")}
+              onChange={(event) => setSensitiveWordsText(event.target.value)}
+              placeholder="一行一个，命中即拒绝"
+              className="min-h-28 rounded-xl border-stone-200 bg-white font-mono text-xs shadow-none"
+            />
+            <p className="text-xs text-stone-500">只要用户请求包含任意敏感词，就直接返回拒绝。</p>
+          </div>
+          <div className="space-y-4 rounded-xl border border-stone-200 bg-white px-4 py-3 md:col-span-2">
+            <label className="flex items-center gap-3 text-sm text-stone-700">
+              <Checkbox
+                checked={Boolean(config?.ai_review?.enabled)}
+                onCheckedChange={(checked) => setAIReviewField("enabled", Boolean(checked))}
+              />
+              启用 AI 审核
+            </label>
+            <p className="text-xs leading-6 text-stone-500">
+              开启后会在请求进入生图账号前先调用审核模型，审核不通过会直接拒绝，减少违规提示词触达账号造成风控或封号的风险。
+            </p>
+            <div className="grid gap-4 md:grid-cols-3">
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">Base URL</label>
+                <Input value={String(config?.ai_review?.base_url || "")} onChange={(event) => setAIReviewField("base_url", event.target.value)} placeholder="https://api.openai.com" className="h-10 rounded-xl border-stone-200 bg-white" />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">API Key</label>
+                <Input value={String(config?.ai_review?.api_key || "")} onChange={(event) => setAIReviewField("api_key", event.target.value)} placeholder="sk-..." className="h-10 rounded-xl border-stone-200 bg-white" />
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm text-stone-700">Model</label>
+                <Input value={String(config?.ai_review?.model || "")} onChange={(event) => setAIReviewField("model", event.target.value)} placeholder="gpt-5.4-mini" className="h-10 rounded-xl border-stone-200 bg-white" />
+              </div>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm text-stone-700">审核提示词</label>
+              <Textarea value={String(config?.ai_review?.prompt || "")} onChange={(event) => setAIReviewField("prompt", event.target.value)} placeholder="判断用户请求是否允许。只回答 ALLOW 或 REJECT。" className="min-h-24 rounded-xl border-stone-200 bg-white text-xs shadow-none" />
             </div>
           </div>
         </div>

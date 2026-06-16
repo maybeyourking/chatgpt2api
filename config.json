@@ -96,7 +96,6 @@
   "image_check_before_hit_enabled": true,
   "image_settle_secs": 2,
   "auto_relogin_after_refresh": true,
-  "image_timeout_retry_secs": 30
   "image_timeout_retry_secs": 30,
   "third_party_apps": {
     "infinite_canvas": {

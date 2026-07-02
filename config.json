@@ -102,5 +102,6 @@
       "enabled": true,
       "url": "https://gogocanvas.8880618.xyz"
     }
-  }
+  },
+  "image_remove_conversation_after_result": true
 }

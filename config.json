@@ -4,7 +4,7 @@
   "image_retention_days": 15,
   "image_poll_timeout_secs": 120,
   "auto_remove_rate_limited_accounts": false,
-  "auto_remove_invalid_accounts": false,
+  "auto_remove_invalid_accounts": true,
   "log_levels": [
     "debug",
     "error",
@@ -95,7 +95,7 @@
   "image_settle_enabled": true,
   "image_check_before_hit_enabled": true,
   "image_settle_secs": 2,
-  "auto_relogin_after_refresh": true,
+  "auto_relogin_after_refresh": false,
   "image_timeout_retry_secs": 30,
   "third_party_apps": {
     "infinite_canvas": {

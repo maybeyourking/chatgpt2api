@@ -533,6 +533,8 @@ class PlatformRegistrar:
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
+        self.authorize_final_url = ""
+        self.authorize_page_type = ""
 
     def close(self) -> None:
         self.session.close()
@@ -619,6 +621,10 @@ class PlatformRegistrar:
             debug = _response_debug_detail(resp)
             status = getattr(resp, "status_code", "unknown")
             raise RuntimeError(error or f"platform_authorize_http_{status}{detail}, {debug}")
+        self.authorize_final_url = str(getattr(resp, "url", "") or "").strip()
+        payload = _response_json(resp)
+        page = payload.get("page") if isinstance(payload, dict) else None
+        self.authorize_page_type = str(page.get("type") or "").strip().lower() if isinstance(page, dict) else ""
         landed = _authorize_landed_page(resp)
         # 仅打日志，不据此中断：authorize 落地页无法可靠区分注册/登录，
         # 真正的判定交给 user/register（失败会 dump 完整响应）。
@@ -650,6 +656,10 @@ class PlatformRegistrar:
         step(index, "提交注册密码完成")
 
     def _submit_signup_email(self, email: str, index: int) -> None:
+        final_url = self.authorize_final_url.lower()
+        if "/create-account/password" in final_url:
+            step(index, "authorize 已进入密码页，跳过重复提交注册邮箱")
+            return
         step(index, "开始提交注册邮箱")
         headers = self._json_headers(f"{auth_base}/create-account")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "authorize_continue")
@@ -666,6 +676,13 @@ class PlatformRegistrar:
             data = _response_json(resp) if resp is not None else {}
             detail = f", detail={json.dumps(data, ensure_ascii=False)}" if data else ""
             raise RuntimeError(error or f"signup_email_submit_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
+        payload = _response_json(resp)
+        continue_url = str(payload.get("continue_url") or "").strip()
+        if continue_url:
+            self.authorize_final_url = continue_url
+        page = payload.get("page") if isinstance(payload, dict) else None
+        if isinstance(page, dict):
+            self.authorize_page_type = str(page.get("type") or "").strip().lower()
         step(index, "提交注册邮箱完成")
 
     def _send_otp(self, index: int) -> None:

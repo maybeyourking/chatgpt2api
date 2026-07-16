@@ -34,6 +34,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     libpq-dev \
     gcc \
+    nodejs \
+    npm \
     openssl \
     && rm -rf /var/lib/apt/lists/*
 

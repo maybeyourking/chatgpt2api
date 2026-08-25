@@ -79,7 +79,7 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
 
         self.assertTrue(registrar._uses_email_first_signup())
 
-    def test_email_first_flow_validates_otp_before_registering_password(self):
+    def test_email_first_flow_skips_password_when_otp_reaches_about_you(self):
         registrar = object.__new__(openai_register.PlatformRegistrar)
         registrar.authorize_final_url = "https://auth.openai.com/email-verification"
         registrar.authorize_page_type = "email_otp_verification"
@@ -87,15 +87,16 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         registrar._send_otp = lambda index: calls.append("send_otp")
         def validate_otp(mailbox, index):
             calls.append("validate_otp")
-            registrar.authorize_final_url = "https://auth.openai.com/create-account/password"
-            registrar.authorize_page_type = "create_account_password"
+            registrar.authorize_final_url = "https://auth.openai.com/about-you"
+            registrar.authorize_page_type = "about_you"
 
         registrar._wait_and_validate_otp = validate_otp
         registrar._register_user = lambda email, password, index: calls.append("register_password")
 
-        registrar._complete_signup_auth("user@example.com", "password", {}, 1)
+        password_registered = registrar._complete_signup_auth("user@example.com", "password", {}, 1)
 
-        self.assertEqual(calls, ["send_otp", "validate_otp", "register_password"])
+        self.assertEqual(calls, ["send_otp", "validate_otp"])
+        self.assertFalse(password_registered)
 
     def test_email_first_flow_rejects_unknown_state_after_otp(self):
         registrar = object.__new__(openai_register.PlatformRegistrar)
@@ -105,7 +106,7 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         registrar._wait_and_validate_otp = lambda mailbox, index: None
         registrar._register_user = lambda email, password, index: self.fail("password endpoint should not be called")
 
-        with self.assertRaisesRegex(RuntimeError, "authorization_state_after_otp_not_password"):
+        with self.assertRaisesRegex(RuntimeError, "authorization_state_after_otp_unknown"):
             registrar._complete_signup_auth("user@example.com", "password", {}, 1)
 
     def test_password_first_flow_keeps_existing_order(self):
@@ -123,9 +124,10 @@ class RegisterProxyRuntimeTests(unittest.TestCase):
         registrar._send_otp = lambda index: calls.append("send_otp")
         registrar._wait_and_validate_otp = lambda mailbox, index: calls.append("validate_otp")
 
-        registrar._complete_signup_auth("user@example.com", "password", {}, 1)
+        password_registered = registrar._complete_signup_auth("user@example.com", "password", {}, 1)
 
         self.assertEqual(calls, ["submit_email", "register_password", "send_otp", "validate_otp"])
+        self.assertTrue(password_registered)
 
     def test_create_session_uses_proxy_settings_without_breaking_existing_proxy_argument(self):
         fake_proxy = FakeProxySettings()

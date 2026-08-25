@@ -733,8 +733,9 @@ class PlatformRegistrar:
             raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}_body={body}")
         payload = _response_json(resp)
         continue_url = str(payload.get("continue_url") or "").strip()
-        if continue_url:
-            self.authorize_final_url = continue_url
+        response_url = str(getattr(resp, "url", "") or "").strip()
+        if continue_url or response_url:
+            self.authorize_final_url = continue_url or response_url
         page = payload.get("page") if isinstance(payload, dict) else None
         if isinstance(page, dict):
             self.authorize_page_type = str(page.get("type") or "").strip().lower()
@@ -762,23 +763,31 @@ class PlatformRegistrar:
             "password" in page_type and "verification" not in page_type
         )
 
-    def _complete_signup_auth(self, email: str, password: str, mailbox: dict, index: int) -> None:
+    def _profile_creation_ready(self) -> bool:
+        final_url = self.authorize_final_url.lower()
+        return "/about-you" in final_url or self.authorize_page_type.lower() == "about_you"
+
+    def _complete_signup_auth(self, email: str, password: str, mailbox: dict, index: int) -> bool:
         if not self._uses_email_first_signup():
             self._submit_signup_email(email, index)
         if self._uses_email_first_signup():
             self._send_otp(index)
             self._wait_and_validate_otp(mailbox, index)
+            if self._profile_creation_ready():
+                step(index, "邮箱验证后已进入资料页，跳过密码提交", "yellow")
+                return False
             if not self._password_registration_ready():
                 raise RuntimeError(
-                    "authorization_state_after_otp_not_password"
+                    "authorization_state_after_otp_unknown"
                     f": page_type={self.authorize_page_type or 'unknown'}, "
                     f"url={self.authorize_final_url[:160]}"
                 )
             self._register_user(email, password, index)
-            return
+            return True
         self._register_user(email, password, index)
         self._send_otp(index)
         self._wait_and_validate_otp(mailbox, index)
+        return True
 
     def _create_account(self, name: str, birthdate: str, index: int) -> None:
         step(index, "开始创建账号资料")
@@ -846,7 +855,7 @@ class PlatformRegistrar:
             password = _random_password()
             first_name, last_name = _random_name()
             self._platform_authorize(email, index)
-            self._complete_signup_auth(email, password, mailbox, index)
+            password_registered = self._complete_signup_auth(email, password, mailbox, index)
             self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
             tokens = self._exchange_registered_tokens(index)
         except Exception as error:
@@ -855,7 +864,7 @@ class PlatformRegistrar:
         mail_provider.mark_mailbox_result(mailbox, success=True)
         return {
             "email": email,
-            "password": password,
+            "password": password if password_registered else "",
             "access_token": str(tokens.get("access_token") or "").strip(),
             "refresh_token": str(tokens.get("refresh_token") or "").strip(),
             "id_token": str(tokens.get("id_token") or "").strip(),

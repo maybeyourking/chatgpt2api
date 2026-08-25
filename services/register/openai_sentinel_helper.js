@@ -122,6 +122,43 @@ function findProvider(scope) {
   return null;
 }
 
+const KNOWN_SDK_LAYOUTS = {
+  "49d0284bf3eea8a5": {
+    provider: "E",
+    setRequirements: "D",
+    startObserver: "Mt",
+    snapshot: "qt",
+    turnstile: "Rn",
+    serializer: "me",
+  },
+};
+
+function resolveKnownInternals(scope, fingerprint) {
+  const layout = KNOWN_SDK_LAYOUTS[fingerprint];
+  if (!layout) {
+    return null;
+  }
+  const resolved = {
+    P: scope[layout.provider],
+    D: scope[layout.setRequirements],
+    Et: scope[layout.startObserver],
+    Nt: scope[layout.snapshot],
+    _n: scope[layout.turnstile],
+    ce: scope[layout.serializer],
+  };
+  const providerValid =
+    resolved.P &&
+    typeof resolved.P.getRequirementsToken === "function" &&
+    typeof resolved.P.getEnforcementToken === "function";
+  const missing = Object.entries(resolved)
+    .filter(([name, value]) => (name === "P" ? !providerValid : typeof value !== "function"))
+    .map(([name]) => name);
+  if (missing.length > 0) {
+    throw new Error(`known_sdk_layout_invalid missing=${missing.join(",")} fingerprint=${fingerprint}`);
+  }
+  return resolved;
+}
+
 function callExpressionAt(source, nameOffset) {
   const openParen = source.indexOf("(", nameOffset);
   if (openParen < 0) {
@@ -204,6 +241,10 @@ function resolveInternals(sdk, fingerprint) {
   }
 
   const scope = sdk?.__scope && typeof sdk.__scope === "object" ? sdk.__scope : {};
+  const known = resolveKnownInternals(scope, fingerprint);
+  if (known) {
+    return known;
+  }
   const provider = findProvider(scope);
   const used = new Set();
   if (provider) {
@@ -389,6 +430,7 @@ module.exports = {
   findExportAssignment,
   patchSdkSource,
   resolveInternals,
+  resolveKnownInternals,
   scopeFunctionCalls,
   sourceFingerprint,
 };

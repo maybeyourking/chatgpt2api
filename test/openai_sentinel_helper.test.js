@@ -11,6 +11,7 @@ const vm = require("node:vm");
 const {
   patchSdkSource,
   resolveInternals,
+  resolveKnownInternals,
 } = require("../services/register/openai_sentinel_helper.js");
 
 function evaluateFixture(source) {
@@ -83,6 +84,34 @@ test("resolves SDK roles by capabilities instead of minified names", () => {
   assert.equal(internals.Nt, sdk.__scope.dd);
   assert.equal(internals._n, sdk.__scope.ee);
   assert.equal(internals.ce, sdk.__scope.ff);
+});
+
+test("resolves the deployed 20260810913b SDK layout by verified fingerprint", () => {
+  const provider = { getRequirementsToken() {}, getEnforcementToken() {} };
+  const scope = {
+    E: provider,
+    D() {},
+    Mt() {},
+    qt() {},
+    Rn() {},
+    me() {},
+  };
+
+  const internals = resolveKnownInternals(scope, "49d0284bf3eea8a5");
+
+  assert.equal(internals.P, provider);
+  assert.equal(internals.D, scope.D);
+  assert.equal(internals.Et, scope.Mt);
+  assert.equal(internals.Nt, scope.qt);
+  assert.equal(internals._n, scope.Rn);
+  assert.equal(internals.ce, scope.me);
+});
+
+test("rejects a known fingerprint when its expected capabilities changed", () => {
+  assert.throws(
+    () => resolveKnownInternals({ E: {} }, "49d0284bf3eea8a5"),
+    /known_sdk_layout_invalid missing=/
+  );
 });
 
 test("reports a source fingerprint when the export layout is unsupported", () => {

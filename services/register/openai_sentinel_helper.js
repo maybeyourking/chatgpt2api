@@ -4,7 +4,7 @@
 const fs = require("node:fs");
 const vm = require("node:vm");
 const { performance } = require("node:perf_hooks");
-const { webcrypto } = require("node:crypto");
+const { createHash, webcrypto } = require("node:crypto");
 
 function fail(message) {
   process.stderr.write(`${message}\n`);
@@ -15,15 +15,234 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function patchSdkSource(source) {
-  const marker = "t.init=we,t.sessionObserverToken=async function(t){";
-  if (!source.includes(marker)) {
-    throw new Error("unsupported_sdk_layout");
+const JS_RESERVED_WORDS = new Set([
+  "await", "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete",
+  "do", "else", "enum", "export", "extends", "false", "finally", "for", "function", "if", "import",
+  "in", "instanceof", "let", "new", "null", "return", "static", "super", "switch", "this", "throw",
+  "true", "try", "typeof", "undefined", "var", "void", "while", "with", "yield",
+]);
+
+function sourceFingerprint(source) {
+  return createHash("sha256").update(source).digest("hex").slice(0, 16);
+}
+
+function collectScopeCandidates(source, endOffset) {
+  const names = new Set();
+  const identifierPattern = /[$A-Z_a-z][$\w]*/g;
+  const prefix = source.slice(0, endOffset);
+  let match;
+  while ((match = identifierPattern.exec(prefix)) !== null) {
+    const name = match[0];
+    if (!JS_RESERVED_WORDS.has(name)) {
+      names.add(name);
+    }
   }
-  return source.replace(
-    marker,
-    't.__internals={P:P,D:D,Et:Et,Nt:Nt,_n:_n,ce:ce,qn:qn};t.init=we,t.sessionObserverToken=async function(t){'
+  return [...names];
+}
+
+function buildScopeCapture(names, fingerprint) {
+  const accumulator = `__sentinelScope_${fingerprint}`;
+  const captures = names.map(
+    (name) => `try{${accumulator}[${JSON.stringify(name)}]=${name}}catch{}`
   );
+  return `(()=>{const ${accumulator}=Object.create(null);${captures.join("")}return ${accumulator}})()`;
+}
+
+function findExportAssignment(source) {
+  const pattern = /([$A-Z_a-z][$\w]*)\.sessionObserverToken\s*=/g;
+  let found = null;
+  let match;
+  while ((match = pattern.exec(source)) !== null) {
+    found = {
+      index: match.index,
+      target: match[1],
+      text: match[0],
+    };
+  }
+  return found;
+}
+
+function patchSdkSource(source) {
+  const fingerprint = sourceFingerprint(source);
+  const legacyMarker = "t.init=we,t.sessionObserverToken=async function(t){";
+  if (source.includes(legacyMarker)) {
+    return {
+      fingerprint,
+      source: source.replace(
+        legacyMarker,
+        't.__internals={P:P,D:D,Et:Et,Nt:Nt,_n:_n,ce:ce};t.init=we,t.sessionObserverToken=async function(t){'
+      ),
+    };
+  }
+
+  const exportAssignment = findExportAssignment(source);
+  if (!exportAssignment) {
+    throw new Error(`unsupported_sdk_layout export_anchor_missing fingerprint=${fingerprint}`);
+  }
+
+  const scopeNames = collectScopeCandidates(source, exportAssignment.index);
+  const scopeCapture = buildScopeCapture(scopeNames, fingerprint);
+  const replacement = `${exportAssignment.target}.__scope=${scopeCapture},${exportAssignment.text}`;
+  return {
+    fingerprint,
+    source: source.slice(0, exportAssignment.index) + replacement + source.slice(exportAssignment.index + exportAssignment.text.length),
+  };
+}
+
+function functionSource(value) {
+  if (typeof value !== "function") {
+    return "";
+  }
+  try {
+    return Function.prototype.toString.call(value);
+  } catch {
+    return "";
+  }
+}
+
+function describeSdkLayout(sdk, fingerprint) {
+  const scope = sdk?.__scope && typeof sdk.__scope === "object" ? sdk.__scope : {};
+  const callableNames = Object.entries(scope)
+    .filter(([, value]) => typeof value === "function")
+    .map(([name]) => name)
+    .slice(0, 80);
+  return `fingerprint=${fingerprint} scope=${Object.keys(scope).length} callables=${callableNames.join(",") || "none"}`;
+}
+
+function findProvider(scope) {
+  for (const value of Object.values(scope)) {
+    if (
+      value &&
+      typeof value.getRequirementsToken === "function" &&
+      typeof value.getEnforcementToken === "function"
+    ) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function callExpressionAt(source, nameOffset) {
+  const openParen = source.indexOf("(", nameOffset);
+  if (openParen < 0) {
+    return "";
+  }
+  let depth = 0;
+  let quote = "";
+  let escaped = false;
+  for (let index = openParen; index < source.length; index += 1) {
+    const char = source[index];
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (char === '"' || char === "'" || char === "`") {
+      quote = char;
+    } else if (char === "(") {
+      depth += 1;
+    } else if (char === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        return source.slice(nameOffset, index + 1);
+      }
+    }
+  }
+  return "";
+}
+
+function scopeFunctionCalls(scope, fn) {
+  const source = functionSource(fn);
+  const calls = [];
+  for (const [name, value] of Object.entries(scope)) {
+    if (typeof value !== "function") {
+      continue;
+    }
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`(?:^|[^.$\\w])${escapedName}\\s*\\(`, "g");
+    let match;
+    while ((match = pattern.exec(source)) !== null) {
+      const callOffset = match.index + match[0].lastIndexOf(name);
+      calls.push({
+        name,
+        value,
+        offset: callOffset,
+        expression: callExpressionAt(source, callOffset).toLowerCase(),
+      });
+    }
+  }
+  return calls.sort((left, right) => left.offset - right.offset);
+}
+
+function findCallByFragments(calls, fragments, excluded = new Set()) {
+  const matches = calls.filter(
+    (call) =>
+      !excluded.has(call.value) &&
+      fragments.every((fragment) => call.expression.includes(fragment.toLowerCase()))
+  );
+  const values = [...new Set(matches.map((call) => call.value))];
+  return values.length === 1 ? values[0] : null;
+}
+
+function resolveInternals(sdk, fingerprint) {
+  const direct = sdk?.__internals || sdk;
+  if (
+    direct &&
+    direct.P &&
+    typeof direct.D === "function" &&
+    typeof direct.Et === "function" &&
+    typeof direct.Nt === "function" &&
+    typeof direct._n === "function" &&
+    typeof direct.ce === "function"
+  ) {
+    return direct;
+  }
+
+  const scope = sdk?.__scope && typeof sdk.__scope === "object" ? sdk.__scope : {};
+  const provider = findProvider(scope);
+  const used = new Set();
+  if (provider) {
+    used.add(provider);
+  }
+
+  const observerCalls = scopeFunctionCalls(scope, sdk?.sessionObserverToken);
+
+  const turnstile = findCallByFragments(observerCalls, ["turnstile", "dx"], used);
+  if (turnstile) used.add(turnstile);
+  const snapshot = findCallByFragments(observerCalls, ["snapshot_dx"], used);
+  if (snapshot) used.add(snapshot);
+  const serializer = findCallByFragments(observerCalls, ["{", "p:", "t:", "c:"], used);
+  if (serializer) used.add(serializer);
+
+  const remainingCalls = observerCalls.filter((call) => !used.has(call.value));
+  const twoArgumentCalls = [...new Set(remainingCalls.filter((call) => call.value.length >= 2).map((call) => call.value))];
+  const oneArgumentCalls = [...new Set(remainingCalls.filter((call) => call.value.length <= 1).map((call) => call.value))];
+  const setRequirements = twoArgumentCalls.length === 1 ? twoArgumentCalls[0] : null;
+  if (setRequirements) used.add(setRequirements);
+  const startObserver = oneArgumentCalls.length === 1 ? oneArgumentCalls[0] : null;
+
+  const resolved = {
+    P: provider,
+    D: setRequirements,
+    Et: startObserver,
+    Nt: snapshot,
+    _n: turnstile,
+    ce: serializer,
+  };
+  const missing = Object.entries(resolved)
+    .filter(([, value]) => !value)
+    .map(([name]) => name);
+  if (missing.length > 0) {
+    throw new Error(
+      `unsupported_sdk_layout missing=${missing.join(",")} ${describeSdkLayout(sdk, fingerprint)}`
+    );
+  }
+  return resolved;
 }
 
 function createSandbox({ sdkUrl, deviceId }) {
@@ -98,15 +317,15 @@ function createSandbox({ sdkUrl, deviceId }) {
 async function main() {
   const raw = fs.readFileSync(0, "utf8");
   const payload = JSON.parse(raw || "{}");
-  const source = patchSdkSource(fs.readFileSync(payload.sdkPath, "utf8"));
+  const patched = patchSdkSource(fs.readFileSync(payload.sdkPath, "utf8"));
   const sandbox = createSandbox({ sdkUrl: payload.sdkUrl, deviceId: payload.deviceId });
   vm.createContext(sandbox);
-  vm.runInContext(source, sandbox, { filename: "openai-sentinel-sdk.js" });
+  vm.runInContext(patched.source, sandbox, { filename: "openai-sentinel-sdk.js" });
   const sdk = sandbox.SentinelSDK || sandbox.window?.SentinelSDK;
-  const internals = sdk && (sdk.__internals || sdk);
-  if (!internals) {
+  if (!sdk) {
     fail("sdk_internals_missing");
   }
+  const internals = resolveInternals(sdk, patched.fingerprint);
 
   if (payload.mode === "requirements") {
     const requirementsToken = await internals.P.getRequirementsToken();
@@ -162,4 +381,14 @@ async function main() {
   );
 }
 
-main().catch((error) => fail(error && error.stack ? error.stack : String(error)));
+if (require.main === module) {
+  main().catch((error) => fail(error && error.stack ? error.stack : String(error)));
+}
+
+module.exports = {
+  findExportAssignment,
+  patchSdkSource,
+  resolveInternals,
+  scopeFunctionCalls,
+  sourceFingerprint,
+};

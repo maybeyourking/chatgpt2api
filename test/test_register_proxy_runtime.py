@@ -61,6 +61,72 @@ class FakeProxySettings:
 
 
 class RegisterProxyRuntimeTests(unittest.TestCase):
+    def test_authorize_landed_page_classifies_email_verification(self):
+        response = FakeResponse(url="https://auth.openai.com/email-verification")
+
+        self.assertEqual(openai_register._authorize_landed_page(response), "email_verification")
+
+    def test_platform_authorize_selects_email_first_flow_on_email_verification(self):
+        response = FakeResponse(status_code=200, url="https://auth.openai.com/email-verification")
+
+        with patch.object(openai_register, "create_session", return_value=FakeSession()), patch.object(
+            openai_register,
+            "request_with_local_retry",
+            return_value=(response, ""),
+        ):
+            registrar = openai_register.PlatformRegistrar(proxy="")
+            registrar._platform_authorize("user@example.com", 1)
+
+        self.assertTrue(registrar._uses_email_first_signup())
+
+    def test_email_first_flow_validates_otp_before_registering_password(self):
+        registrar = object.__new__(openai_register.PlatformRegistrar)
+        registrar.authorize_final_url = "https://auth.openai.com/email-verification"
+        registrar.authorize_page_type = "email_otp_verification"
+        calls = []
+        registrar._send_otp = lambda index: calls.append("send_otp")
+        def validate_otp(mailbox, index):
+            calls.append("validate_otp")
+            registrar.authorize_final_url = "https://auth.openai.com/create-account/password"
+            registrar.authorize_page_type = "create_account_password"
+
+        registrar._wait_and_validate_otp = validate_otp
+        registrar._register_user = lambda email, password, index: calls.append("register_password")
+
+        registrar._complete_signup_auth("user@example.com", "password", {}, 1)
+
+        self.assertEqual(calls, ["send_otp", "validate_otp", "register_password"])
+
+    def test_email_first_flow_rejects_unknown_state_after_otp(self):
+        registrar = object.__new__(openai_register.PlatformRegistrar)
+        registrar.authorize_final_url = "https://auth.openai.com/email-verification"
+        registrar.authorize_page_type = "email_otp_verification"
+        registrar._send_otp = lambda index: None
+        registrar._wait_and_validate_otp = lambda mailbox, index: None
+        registrar._register_user = lambda email, password, index: self.fail("password endpoint should not be called")
+
+        with self.assertRaisesRegex(RuntimeError, "authorization_state_after_otp_not_password"):
+            registrar._complete_signup_auth("user@example.com", "password", {}, 1)
+
+    def test_password_first_flow_keeps_existing_order(self):
+        registrar = object.__new__(openai_register.PlatformRegistrar)
+        registrar.authorize_final_url = "https://auth.openai.com/create-account"
+        registrar.authorize_page_type = "create_account"
+        calls = []
+
+        def submit_email(email, index):
+            calls.append("submit_email")
+            registrar.authorize_final_url = "https://auth.openai.com/create-account/password"
+
+        registrar._submit_signup_email = submit_email
+        registrar._register_user = lambda email, password, index: calls.append("register_password")
+        registrar._send_otp = lambda index: calls.append("send_otp")
+        registrar._wait_and_validate_otp = lambda mailbox, index: calls.append("validate_otp")
+
+        registrar._complete_signup_auth("user@example.com", "password", {}, 1)
+
+        self.assertEqual(calls, ["submit_email", "register_password", "send_otp", "validate_otp"])
+
     def test_create_session_uses_proxy_settings_without_breaking_existing_proxy_argument(self):
         fake_proxy = FakeProxySettings()
         created = []

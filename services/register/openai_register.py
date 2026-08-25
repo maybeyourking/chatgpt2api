@@ -235,11 +235,7 @@ def _mail_config(register_proxy: str = "") -> dict:
 
 
 def _authorize_landed_page(resp) -> str:
-    """诊断用：粗判 authorize 之后落在哪个页面。返回 signup / login / "" 仅供日志。
-
-    注意：email-verification / email_otp_verification 在注册和登录流程里都会出现，
-    无法据此可靠区分，所以这里只用于打日志，绝不据此中断注册流程。
-    """
+    """粗判 authorize 之后落到的账号流程页面。"""
     if resp is None:
         return ""
     final_url = str(getattr(resp, "url", "") or "").lower()
@@ -248,10 +244,16 @@ def _authorize_landed_page(resp) -> str:
     page = data.get("page") if isinstance(data, dict) else None
     if isinstance(page, dict):
         page_type = str(page.get("type") or "").lower()
-    if "create-account" in final_url or "signup" in final_url or "create_account" in page_type:
-        return "signup"
+    if (
+        "email-verification" in final_url
+        or "email_otp_verification" in page_type
+        or "email_verification" in page_type
+    ):
+        return "email_verification"
     if "/log-in" in final_url or "/login" in final_url or page_type in {"login", "password_verification"}:
         return "login"
+    if "create-account" in final_url or "signup" in final_url or "create_account" in page_type:
+        return "signup"
     return ""
 
 
@@ -626,9 +628,15 @@ class PlatformRegistrar:
         page = payload.get("page") if isinstance(payload, dict) else None
         self.authorize_page_type = str(page.get("type") or "").strip().lower() if isinstance(page, dict) else ""
         landed = _authorize_landed_page(resp)
-        # 仅打日志，不据此中断：authorize 落地页无法可靠区分注册/登录，
-        # 真正的判定交给 user/register（失败会 dump 完整响应）。
         step(index, f"platform authorize 完成[{landed or '?'}] url={str(getattr(resp, 'url', '') or '')[:160]}")
+        if landed == "login":
+            raise RuntimeError(
+                "authorization_state_not_signup"
+                f": landed={landed}, page_type={self.authorize_page_type or 'unknown'}, "
+                f"url={self.authorize_final_url[:160]}"
+            )
+        if landed == "email_verification":
+            step(index, "检测到邮箱优先注册流程，将先完成邮箱验证再提交密码", "yellow")
 
     def _register_user(self, email: str, password: str, index: int) -> None:
         step(index, "开始提交注册密码")
@@ -660,6 +668,15 @@ class PlatformRegistrar:
         if "/create-account/password" in final_url:
             step(index, "authorize 已进入密码页，跳过重复提交注册邮箱")
             return
+        if "email-verification" in final_url or self.authorize_page_type in {
+            "email_verification",
+            "email_otp_verification",
+        }:
+            raise RuntimeError(
+                "authorization_state_not_signup"
+                f": landed=email_verification, page_type={self.authorize_page_type or 'unknown'}, "
+                f"url={self.authorize_final_url[:160]}"
+            )
         step(index, "开始提交注册邮箱")
         headers = self._json_headers(f"{auth_base}/create-account")
         headers["openai-sentinel-token"] = build_sentinel_token(self.session, self.device_id, "authorize_continue")
@@ -678,8 +695,9 @@ class PlatformRegistrar:
             raise RuntimeError(error or f"signup_email_submit_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
         payload = _response_json(resp)
         continue_url = str(payload.get("continue_url") or "").strip()
-        if continue_url:
-            self.authorize_final_url = continue_url
+        response_url = str(getattr(resp, "url", "") or "").strip()
+        if continue_url or response_url:
+            self.authorize_final_url = continue_url or response_url
         page = payload.get("page") if isinstance(payload, dict) else None
         if isinstance(page, dict):
             self.authorize_page_type = str(page.get("type") or "").strip().lower()
@@ -688,13 +706,14 @@ class PlatformRegistrar:
     def _send_otp(self, index: int) -> None:
         step(index, "开始发送验证码")
         url = f"{auth_base}/api/accounts/email-otp/send"
-        headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password"), url, self.proxy, self.clearance_user_agent)
+        referer = f"{auth_base}/email-verification" if self._uses_email_first_signup() else f"{auth_base}/create-account/password"
+        headers = _headers_with_clearance(self._navigate_headers(referer), url, self.proxy, self.clearance_user_agent)
         resp, error = request_with_local_retry(self.session, "get", url, headers=headers, allow_redirects=True, verify=False)
         if _is_cloudflare_challenge(resp):
             bundle = self._refresh_cloudflare_clearance(auth_base, index)
             if bundle is None:
                 raise RuntimeError(_cloudflare_block_message(resp, reason=self.clearance_failure_reason))
-            headers = _headers_with_clearance(self._navigate_headers(f"{auth_base}/create-account/password"), url, self.proxy, self.clearance_user_agent)
+            headers = _headers_with_clearance(self._navigate_headers(referer), url, self.proxy, self.clearance_user_agent)
             resp, error = request_with_local_retry(self.session, "get", url, headers=headers, allow_redirects=True, verify=False)
             if _is_cloudflare_challenge(resp):
                 raise RuntimeError(_cloudflare_block_message(resp, "Cloudflare clearance 重试仍被拦截"))
@@ -712,7 +731,54 @@ class PlatformRegistrar:
             except Exception:
                 pass
             raise RuntimeError(error or f"validate_otp_http_{getattr(resp, 'status_code', 'unknown')}_body={body}")
+        payload = _response_json(resp)
+        continue_url = str(payload.get("continue_url") or "").strip()
+        if continue_url:
+            self.authorize_final_url = continue_url
+        page = payload.get("page") if isinstance(payload, dict) else None
+        if isinstance(page, dict):
+            self.authorize_page_type = str(page.get("type") or "").strip().lower()
         step(index, "验证码校验完成")
+
+    def _wait_and_validate_otp(self, mailbox: dict, index: int) -> None:
+        step(index, "开始等待注册验证码")
+        code = wait_for_code(mailbox, register_proxy=self.proxy)
+        if not code:
+            raise RuntimeError("等待注册验证码超时")
+        step(index, f"收到注册验证码: {code}")
+        self._validate_otp(code, index)
+
+    def _uses_email_first_signup(self) -> bool:
+        final_url = self.authorize_final_url.lower()
+        return "email-verification" in final_url or self.authorize_page_type in {
+            "email_verification",
+            "email_otp_verification",
+        }
+
+    def _password_registration_ready(self) -> bool:
+        final_url = self.authorize_final_url.lower()
+        page_type = self.authorize_page_type.lower()
+        return "/create-account/password" in final_url or (
+            "password" in page_type and "verification" not in page_type
+        )
+
+    def _complete_signup_auth(self, email: str, password: str, mailbox: dict, index: int) -> None:
+        if not self._uses_email_first_signup():
+            self._submit_signup_email(email, index)
+        if self._uses_email_first_signup():
+            self._send_otp(index)
+            self._wait_and_validate_otp(mailbox, index)
+            if not self._password_registration_ready():
+                raise RuntimeError(
+                    "authorization_state_after_otp_not_password"
+                    f": page_type={self.authorize_page_type or 'unknown'}, "
+                    f"url={self.authorize_final_url[:160]}"
+                )
+            self._register_user(email, password, index)
+            return
+        self._register_user(email, password, index)
+        self._send_otp(index)
+        self._wait_and_validate_otp(mailbox, index)
 
     def _create_account(self, name: str, birthdate: str, index: int) -> None:
         step(index, "开始创建账号资料")
@@ -780,15 +846,7 @@ class PlatformRegistrar:
             password = _random_password()
             first_name, last_name = _random_name()
             self._platform_authorize(email, index)
-            self._submit_signup_email(email, index)
-            self._register_user(email, password, index)
-            self._send_otp(index)
-            step(index, "开始等待注册验证码")
-            code = wait_for_code(mailbox, register_proxy=self.proxy)
-            if not code:
-                raise RuntimeError("等待注册验证码超时")
-            step(index, f"收到注册验证码: {code}")
-            self._validate_otp(code, index)
+            self._complete_signup_auth(email, password, mailbox, index)
             self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
             tokens = self._exchange_registered_tokens(index)
         except Exception as error:

@@ -14,6 +14,16 @@ from services.register import mail_provider, openai_register
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
+SYSTEMIC_FAILURE_LIMIT = 3
+
+
+def _systemic_failure_family(error: object) -> str:
+    text = str(error or "").lower()
+    if "authorization_state_" in text or "invalid_auth_step" in text:
+        return "authorization_state"
+    if "unsupported_sdk_layout" in text or "sentinel_sdk_helper_failed" in text:
+        return "sentinel_sdk"
+    return ""
 
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
@@ -288,6 +298,7 @@ class RegisterService:
     def _run(self) -> None:
         threads = int(self.get()["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
+        systemic_family, systemic_failures = "", 0
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
@@ -308,6 +319,20 @@ class RegisterService:
                         result = future.result()
                         success += 1 if result.get("ok") else 0
                         fail += 0 if result.get("ok") else 1
+                        family = "" if result.get("ok") else _systemic_failure_family(result.get("error"))
+                        if family:
+                            systemic_failures = systemic_failures + 1 if family == systemic_family else 1
+                            systemic_family = family
+                        else:
+                            systemic_family, systemic_failures = "", 0
+                        if systemic_failures >= SYSTEMIC_FAILURE_LIMIT:
+                            with self._lock:
+                                self._config["enabled"] = False
+                                self._save()
+                            self._append_log(
+                                f"连续 {systemic_failures} 次出现系统性注册错误（{systemic_family}），已自动停止任务，请检查授权流程后再试",
+                                "red",
+                            )
                     except Exception:
                         fail += 1
         self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
